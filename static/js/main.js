@@ -74,6 +74,11 @@ document.addEventListener('DOMContentLoaded', () => {
             body: datiForm
         })
         .then(async risposta => {
+            // Gestisci risposte non-JSON (es. timeout proxy, errore server)
+            const contentType = risposta.headers.get('content-type') || '';
+            if (!contentType.includes('application/json')) {
+                throw new Error(`Il server ha impiegato troppo tempo o ha restituito un errore (Status ${risposta.status}). Riprova.`);
+            }
             const dati = await risposta.json();
             if (!risposta.ok) {
                 throw new Error(dati.errore || "Errore sconosciuto durante l'elaborazione.");

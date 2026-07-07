@@ -8,6 +8,7 @@ import openpyxl
 import openpyxl.styles.stylesheet
 from openpyxl.styles import Font
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, render_template, send_from_directory, send_file
 
 # Salva il metodo originale ed applica la patch per evitare l'IndexError di openpyxl
@@ -398,35 +399,48 @@ def estrai_date_metadato(source_record):
                         
     return formatta_data(data_pub), formatta_data(data_rev)
 
-def determina_visualizzatore(uid, cache=None):
-    """Determina se un progetto è NUOVO o STANDARD in base al suo UID.
-    
-    Controlla l'endpoint crea-progetti/initFile per verificare se il progetto
-    usa il nuovo visualizzatore. Restituisce ('NUOVO', link) o ('STANDARD', link).
-    """
-    if cache is not None and uid in cache:
-        return cache[uid]
-    
+def _controlla_singolo_uid(uid):
+    """Controlla un singolo UID per determinare il tipo di visualizzatore. Usato internamente dal pool."""
     url_nuovo_json = f"https://rsdi.regione.basilicata.it/crea-progetti/initFile/{uid}.json"
     url_nuovo_viewer = f"https://rsdi-view.regione.basilicata.it/#https://rsdi.regione.basilicata.it/crea-progetti/initFile/{uid}.json"
     url_standard = f"https://rsdi.regione.basilicata.it/viewGis/?project={uid}"
     
     try:
-        risposta = requests.get(url_nuovo_json, verify=False, timeout=10)
+        risposta = requests.get(url_nuovo_json, verify=False, timeout=8)
         if risposta.status_code == 200:
             contenuto = risposta.text.strip()
             if contenuto and contenuto != '{}':
-                risultato = ('NUOVO', url_nuovo_viewer)
-                if cache is not None:
-                    cache[uid] = risultato
-                return risultato
+                return uid, ('NUOVO', url_nuovo_viewer)
     except Exception as e:
         print(f"Errore nel controllo visualizzatore per UID {uid}: {e}")
     
-    risultato = ('STANDARD', url_standard)
-    if cache is not None:
-        cache[uid] = risultato
-    return risultato
+    return uid, ('STANDARD', url_standard)
+
+def precarica_visualizzatori(lista_uid):
+    """Controlla tutti gli UID in parallelo usando un ThreadPoolExecutor.
+    
+    Restituisce un dizionario {uid: ('NUOVO'|'STANDARD', link_visualizzatore)}.
+    Con 10 worker paralleli, 298 UID vengono controllati in ~30 secondi invece di ~5 minuti.
+    """
+    cache = {}
+    if not lista_uid:
+        return cache
+    
+    print(f"Controllo visualizzatore per {len(lista_uid)} UID univoci in parallelo...")
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_controlla_singolo_uid, uid): uid for uid in lista_uid}
+        for future in as_completed(futures):
+            try:
+                uid, risultato = future.result()
+                cache[uid] = risultato
+            except Exception as e:
+                uid = futures[future]
+                print(f"Errore futuro per UID {uid}: {e}")
+                cache[uid] = ('STANDARD', f"https://rsdi.regione.basilicata.it/viewGis/?project={uid}")
+    
+    nuovi = sum(1 for v in cache.values() if v[0] == 'NUOVO')
+    print(f"Completato: {nuovi} NUOVO, {len(cache) - nuovi} STANDARD")
+    return cache
 
 
 @app.route('/')
@@ -512,7 +526,14 @@ def carica_e_elabora():
         idx_ufficio = mappa_colonne.get('ufficio')
         
         soglia_matching = 80
-        cache_visualizzatore = {}  # Cache per evitare richieste duplicate per lo stesso UID
+        
+        # Pre-carica tutti i visualizzatori in parallelo (298 UID unici, ~30s con 10 worker)
+        uid_unici = set()
+        for riga in range(2, sheet.max_row + 1):
+            valore_uid = sheet.cell(row=riga, column=idx_uid).value if idx_uid else None
+            if valore_uid:
+                uid_unici.add(str(valore_uid).strip())
+        cache_visualizzatore = precarica_visualizzatori(uid_unici)
         
         for riga in range(2, sheet.max_row + 1):
             valore_nome_completo = sheet.cell(row=riga, column=idx_nome_completo).value if idx_nome_completo else ""
@@ -574,8 +595,8 @@ def carica_e_elabora():
             # --- Determinazione del Visualizzatore ---
             tipo_visualizzatore = ""
             link_visualizzatore = ""
-            if valore_uid_str:
-                tipo_visualizzatore, link_visualizzatore = determina_visualizzatore(valore_uid_str, cache_visualizzatore)
+            if valore_uid_str and valore_uid_str in cache_visualizzatore:
+                tipo_visualizzatore, link_visualizzatore = cache_visualizzatore[valore_uid_str]
                     
             esito = "NO"
             titolo_trovato = ""
