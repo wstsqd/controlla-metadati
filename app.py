@@ -8,6 +8,7 @@ import openpyxl
 import openpyxl.styles.stylesheet
 from openpyxl.styles import Font
 import io
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, render_template, send_from_directory, send_file
 
@@ -31,6 +32,9 @@ app.config['PROCESSED_FOLDER'] = os.path.join(os.getcwd(), 'processed')
 # Assicurati che le cartelle esistano
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['PROCESSED_FOLDER'], exist_ok=True)
+
+# Registro globale dei job in background {job_id: {status, progress, messaggio, risultati, fileId, errore}}
+jobs = {}
 
 # Endpoint del catalogo GeoNetwork
 URL_CATALOGO = "https://rsdi.regione.basilicata.it/geonetwork/srv/api/search/records/_search"
@@ -451,7 +455,7 @@ def home():
 
 @app.route('/carica', methods=['POST'])
 def carica_e_elabora():
-    """Riceve il file Excel, lo elabora e restituisce i dettagli in formato JSON."""
+    """Riceve il file Excel, lo salva e avvia l'elaborazione in background."""
     if 'file' not in request.files:
         return jsonify({"errore": "Nessun file inviato"}), 400
         
@@ -470,42 +474,74 @@ def carica_e_elabora():
     
     file_excel.save(percorso_upload)
     
-    # Scarica il catalogo metadati
-    catalogo = scarica_catalogo_rsdi()
-    if not catalogo:
-        return jsonify({"errore": "Impossibile connettersi al catalogo RSDI Basilicata. Riprova più tardi."}), 503
-        
+    # Inizializza il job e avvia l'elaborazione in background
+    job_id = id_sessione
+    jobs[job_id] = {
+        'status': 'processing',
+        'progress': 0,
+        'messaggio': 'Connessione al catalogo metadati RSDI...',
+        'risultati': None,
+        'fileId': None,
+        'errore': None
+    }
+    
+    thread = threading.Thread(
+        target=elabora_in_background,
+        args=(job_id, percorso_upload, percorso_elaborato, nome_salvato),
+        daemon=True
+    )
+    thread.start()
+    
+    # Restituisce immediatamente il job_id (entro 1 secondo, nessun timeout)
+    return jsonify({"jobId": job_id})
+
+
+def elabora_in_background(job_id, percorso_upload, percorso_elaborato, nome_salvato):
+    """Elabora il file Excel in un thread background, aggiornando il progresso nel registro jobs."""
     try:
-        # Carica il workbook mantenendo lo stile e la formattazione originale
+        # Scarica il catalogo metadati
+        jobs[job_id]['messaggio'] = 'Download catalogo metadati RSDI...'
+        jobs[job_id]['progress'] = 5
+        catalogo = scarica_catalogo_rsdi()
+        if not catalogo:
+            jobs[job_id]['status'] = 'error'
+            jobs[job_id]['errore'] = 'Impossibile connettersi al catalogo RSDI Basilicata. Riprova più tardi.'
+            return
+        
+        jobs[job_id]['progress'] = 10
+        jobs[job_id]['messaggio'] = 'Apertura file Excel...'
+        
+        # Carica il workbook
         wb = openpyxl.load_workbook(percorso_upload)
         if not wb.sheetnames:
-            return jsonify({"errore": "File Excel vuoto o non valido"}), 400
+            jobs[job_id]['status'] = 'error'
+            jobs[job_id]['errore'] = 'File Excel vuoto o non valido'
+            return
             
         sheet = wb.active
         
-        # Identifica gli indici delle colonne basandosi sull'intestazione (riga 1)
+        # Identifica gli indici delle colonne
         riga_intestazione = [str(cella.value).strip().lower() if cella.value is not None else "" for cella in sheet[1]]
         
-        # Mappa dei nomi delle colonne alle posizioni (1-indexed per openpyxl)
-        # Gestione speciale: 'nome' appare due volte (col 2 = nome progetto, col 7 = nome layer)
         mappa_colonne = {}
         colonne_richieste = ['nome_completo', 'catalogo', 'data_pubblicazione', 'data_revisione', 'visualizzatore', 'uid', 'ufficio']
         for col_name in colonne_richieste:
             if col_name in riga_intestazione:
                 mappa_colonne[col_name] = riga_intestazione.index(col_name) + 1
         
-        # Per la colonna 'nome' (layer), prendi l'ULTIMA occorrenza (col 7, non col 2)
+        # Per la colonna 'nome' (layer), prendi l'ULTIMA occorrenza
         indici_nome = [i + 1 for i, val in enumerate(riga_intestazione) if val == 'nome']
         if len(indici_nome) >= 2:
-            mappa_colonne['nome_layer'] = indici_nome[-1]  # Ultima occorrenza = nome del layer
+            mappa_colonne['nome_layer'] = indici_nome[-1]
         elif len(indici_nome) == 1:
             mappa_colonne['nome_layer'] = indici_nome[0]
                 
-        # Verifica se mancano le colonne critiche di input
         if 'nome_completo' not in mappa_colonne and 'nome_layer' not in mappa_colonne:
-            return jsonify({"errore": "Il file Excel deve contenere almeno le colonne 'nome_completo' o 'nome'."}), 400
+            jobs[job_id]['status'] = 'error'
+            jobs[job_id]['errore'] = "Il file Excel deve contenere almeno le colonne 'nome_completo' o 'nome'."
+            return
             
-        # Se mancano le colonne di output, le creiamo in fondo alla tabella
+        # Crea colonne di output mancanti
         nuovo_indice_colonna = len(riga_intestazione) + 1
         for col_name in ['catalogo', 'data_pubblicazione', 'data_revisione', 'visualizzatore', 'ufficio']:
             if col_name not in mappa_colonne:
@@ -513,9 +549,6 @@ def carica_e_elabora():
                 mappa_colonne[col_name] = nuovo_indice_colonna
                 nuovo_indice_colonna += 1
                 
-        # Elaborazione delle righe (dalla riga 2 in poi)
-        cronologia_elaborazione = []
-        
         idx_nome_completo = mappa_colonne.get('nome_completo')
         idx_nome_layer = mappa_colonne.get('nome_layer')
         idx_catalogo = mappa_colonne.get('catalogo')
@@ -525,9 +558,10 @@ def carica_e_elabora():
         idx_uid = mappa_colonne.get('uid')
         idx_ufficio = mappa_colonne.get('ufficio')
         
-        soglia_matching = 80
+        # Pre-carica i visualizzatori in parallelo
+        jobs[job_id]['messaggio'] = 'Controllo visualizzatori in parallelo...'
+        jobs[job_id]['progress'] = 15
         
-        # Pre-carica tutti i visualizzatori in parallelo (298 UID unici, ~30s con 10 worker)
         uid_unici = set()
         for riga in range(2, sheet.max_row + 1):
             valore_uid = sheet.cell(row=riga, column=idx_uid).value if idx_uid else None
@@ -535,12 +569,19 @@ def carica_e_elabora():
                 uid_unici.add(str(valore_uid).strip())
         cache_visualizzatore = precarica_visualizzatori(uid_unici)
         
-        for riga in range(2, sheet.max_row + 1):
+        jobs[job_id]['progress'] = 40
+        jobs[job_id]['messaggio'] = 'Analisi e confronto con il catalogo...'
+        
+        # Elaborazione righe
+        cronologia_elaborazione = []
+        soglia_matching = 80
+        righe_totali = sheet.max_row - 1  # escludi header
+        
+        for idx_riga, riga in enumerate(range(2, sheet.max_row + 1)):
             valore_nome_completo = sheet.cell(row=riga, column=idx_nome_completo).value if idx_nome_completo else ""
             valore_nome_layer = sheet.cell(row=riga, column=idx_nome_layer).value if idx_nome_layer else ""
             valore_uid = sheet.cell(row=riga, column=idx_uid).value if idx_uid else ""
             
-            # Se la riga è completamente vuota, la saltiamo
             if not valore_nome_completo and not valore_nome_layer:
                 continue
                 
@@ -548,7 +589,7 @@ def carica_e_elabora():
             valore_nome_layer_str = str(valore_nome_layer).strip() if valore_nome_layer is not None else ""
             valore_uid_str = str(valore_uid).strip() if valore_uid is not None else ""
             
-            # Gestione namespace: se il nome contiene ':', prepara anche la versione senza namespace
+            # Gestione namespace
             valore_nome_layer_senza_ns = ""
             if ':' in valore_nome_layer_str:
                 valore_nome_layer_senza_ns = valore_nome_layer_str.split(':', 1)[1]
@@ -579,10 +620,8 @@ def carica_e_elabora():
                     
                 testo_completo = " ".join(source.get('anyText', [])) if isinstance(source.get('anyText'), list) else str(source.get('anyText', ''))
                 
-                # Ricerca 1: nome_completo come 'layer', nome_layer come 'nome_db'
                 score = valuta_corrispondenza(valore_nome_completo_str, valore_nome_layer_str, titolo, uuid_sch, identificatore, testo_completo)
                 
-                # Ricerca 2: se il nome_layer contiene ':', prova con la parte dopo i due punti
                 if valore_nome_layer_senza_ns:
                     score_senza_ns = valuta_corrispondenza(valore_nome_completo_str, valore_nome_layer_senza_ns, titolo, uuid_sch, identificatore, testo_completo)
                     if score_senza_ns > score:
@@ -592,7 +631,7 @@ def carica_e_elabora():
                     punteggio_massimo = score
                     miglior_record = scheda
             
-            # --- Determinazione del Visualizzatore ---
+            # Visualizzatore
             tipo_visualizzatore = ""
             link_visualizzatore = ""
             if valore_uid_str and valore_uid_str in cache_visualizzatore:
@@ -614,10 +653,8 @@ def carica_e_elabora():
                 link_trovato = f"https://rsdi.regione.basilicata.it/geonetwork/srv/ita/catalog.search#/metadata/{uuid_trovato}"
                 pub_data, rev_data = estrai_date_metadato(source)
                 
-                # Estrai l'ufficio dal record (orgForResource o contact)
                 org_list = source.get('orgForResource', source.get('OrgForResource', []))
                 if org_list and isinstance(org_list, list):
-                    # Prendi la prima organizzazione come nome ufficio
                     primo_org = org_list[0]
                     if isinstance(primo_org, dict):
                         valore_ufficio = primo_org.get('default', primo_org.get('langita', ''))
@@ -626,21 +663,18 @@ def carica_e_elabora():
                 elif isinstance(org_list, str):
                     valore_ufficio = org_list
                 
-                # Scrittura nel foglio Excel
                 sheet.cell(row=riga, column=idx_catalogo, value=link_trovato)
                 sheet.cell(row=riga, column=idx_pub, value=pub_data if pub_data else None)
                 sheet.cell(row=riga, column=idx_rev, value=rev_data if rev_data else None)
                 if idx_ufficio:
                     sheet.cell(row=riga, column=idx_ufficio, value=valore_ufficio if valore_ufficio else None)
             else:
-                # Nessuna corrispondenza trovata
                 sheet.cell(row=riga, column=idx_catalogo, value="no")
                 sheet.cell(row=riga, column=idx_pub, value=None)
                 sheet.cell(row=riga, column=idx_rev, value=None)
                 if idx_ufficio:
                     sheet.cell(row=riga, column=idx_ufficio, value=None)
             
-            # Scrivi il visualizzatore e sostituisci l'UID con il link
             if idx_visualizzatore:
                 sheet.cell(row=riga, column=idx_visualizzatore, value=tipo_visualizzatore if tipo_visualizzatore else None)
             if idx_uid and link_visualizzatore:
@@ -660,26 +694,58 @@ def carica_e_elabora():
                 "punteggio": punteggio_massimo
             })
             
-        # Salva il file modificato preservando la formattazione originale
+            # Aggiorna il progresso (40% -> 95%)
+            if righe_totali > 0:
+                avanzamento = 40 + int((idx_riga / righe_totali) * 55)
+                jobs[job_id]['progress'] = min(avanzamento, 95)
+            
+        # Salva il file
+        jobs[job_id]['messaggio'] = 'Salvataggio file Excel...'
+        jobs[job_id]['progress'] = 96
         wb.save(percorso_elaborato)
         wb.close()
         
-        # Elimina il file caricato originariamente per pulizia
         if os.path.exists(percorso_upload):
             os.remove(percorso_upload)
             
-        return jsonify({
-            "status": "successo",
-            "fileId": nome_salvato,
-            "risultati": cronologia_elaborazione
-        })
+        # Job completato
+        jobs[job_id]['status'] = 'complete'
+        jobs[job_id]['progress'] = 100
+        jobs[job_id]['messaggio'] = 'Completato!'
+        jobs[job_id]['fileId'] = nome_salvato
+        jobs[job_id]['risultati'] = cronologia_elaborazione
         
     except Exception as e:
-        # Pulisce i file in caso di errore
         if os.path.exists(percorso_upload):
             os.remove(percorso_upload)
         print(f"Errore durante l'elaborazione del file Excel: {e}")
-        return jsonify({"errore": f"Errore durante l'elaborazione del file Excel: {str(e)}"}), 500
+        jobs[job_id]['status'] = 'error'
+        jobs[job_id]['errore'] = f"Errore durante l'elaborazione: {str(e)}"
+
+
+@app.route('/stato/<job_id>', methods=['GET'])
+def stato_job(job_id):
+    """Restituisce lo stato attuale di un job di elaborazione."""
+    if job_id not in jobs:
+        return jsonify({"errore": "Job non trovato"}), 404
+    
+    job = jobs[job_id]
+    risposta = {
+        'status': job['status'],
+        'progress': job['progress'],
+        'messaggio': job['messaggio']
+    }
+    
+    if job['status'] == 'complete':
+        risposta['fileId'] = job['fileId']
+        risposta['risultati'] = job['risultati']
+        # Pulizia: rimuovi il job dal registro dopo il recupero
+        del jobs[job_id]
+    elif job['status'] == 'error':
+        risposta['errore'] = job['errore']
+        del jobs[job_id]
+    
+    return jsonify(risposta)
 
 
 @app.route('/scarica/<file_id>', methods=['GET'])

@@ -61,74 +61,73 @@ document.addEventListener('DOMContentLoaded', () => {
         schedaRisultati.style.display = 'none';
         contenitoreProgresso.style.display = 'flex';
         barraProgresso.style.width = '0%';
-        testoStato.textContent = "Connessione al server...";
-
-        // Avvia animazione progresso fittizia per migliorare la UX (arriva al 90% in attesa del backend)
-        avviaProgressoAnimato();
+        testoStato.textContent = "Caricamento file...";
 
         const datiForm = new FormData();
         datiForm.append('file', file);
 
+        // Step 1: Carica il file e ottieni il jobId
         fetch('/carica', {
             method: 'POST',
             body: datiForm
         })
         .then(async risposta => {
-            // Gestisci risposte non-JSON (es. timeout proxy, errore server)
             const contentType = risposta.headers.get('content-type') || '';
             if (!contentType.includes('application/json')) {
-                throw new Error(`Il server ha impiegato troppo tempo o ha restituito un errore (Status ${risposta.status}). Riprova.`);
+                throw new Error(`Errore del server (Status ${risposta.status}). Riprova.`);
             }
             const dati = await risposta.json();
             if (!risposta.ok) {
-                throw new Error(dati.errore || "Errore sconosciuto durante l'elaborazione.");
+                throw new Error(dati.errore || "Errore sconosciuto.");
             }
             return dati;
         })
         .then(dati => {
-            completaProgresso(() => {
-                visualizzaRisultati(dati);
-            });
+            // Step 2: Avvia il polling dello stato
+            avviaPolling(dati.jobId);
         })
         .catch(errore => {
-            fermaProgresso();
             contenitoreProgresso.style.display = 'none';
             mostraErrore(errore.message);
         });
     }
 
-    // Gestione barra progresso fluida
-    function avviaProgressoAnimato() {
-        let percentuale = 0;
-        testoStato.textContent = "Connessione al catalogo metadati RSDI...";
-        
+    // Polling dello stato del job ogni 2 secondi
+    function avviaPolling(jobId) {
         intervalloProgresso = setInterval(() => {
-            if (percentuale < 30) {
-                percentuale += 2;
-            } else if (percentuale < 60) {
-                testoStato.textContent = "Analisi del file Excel e confronto con il catalogo...";
-                percentuale += 1;
-            } else if (percentuale < 90) {
-                testoStato.textContent = "Scrittura delle colonne metadati e date...";
-                percentuale += 0.5;
-            }
-            barraProgresso.style.width = `${percentuale}%`;
-        }, 150);
-    }
+            fetch(`/stato/${jobId}`)
+            .then(async risposta => {
+                if (!risposta.ok) {
+                    const dati = await risposta.json().catch(() => ({}));
+                    throw new Error(dati.errore || `Errore stato (${risposta.status})`);
+                }
+                return risposta.json();
+            })
+            .then(stato => {
+                // Aggiorna la barra e il testo con i dati reali dal server
+                barraProgresso.style.width = `${stato.progress}%`;
+                testoStato.textContent = stato.messaggio || "Elaborazione...";
 
-    function completaProgresso(callback) {
-        clearInterval(intervalloProgresso);
-        barraProgresso.style.width = '100%';
-        testoStato.textContent = "Completato!";
-        
-        setTimeout(() => {
-            contenitoreProgresso.style.display = 'none';
-            if (callback) callback();
-        }, 600);
-    }
-
-    function fermaProgresso() {
-        clearInterval(intervalloProgresso);
+                if (stato.status === 'complete') {
+                    clearInterval(intervalloProgresso);
+                    barraProgresso.style.width = '100%';
+                    testoStato.textContent = "Completato!";
+                    setTimeout(() => {
+                        contenitoreProgresso.style.display = 'none';
+                        visualizzaRisultati(stato);
+                    }, 600);
+                } else if (stato.status === 'error') {
+                    clearInterval(intervalloProgresso);
+                    contenitoreProgresso.style.display = 'none';
+                    mostraErrore(stato.errore || "Errore durante l'elaborazione.");
+                }
+            })
+            .catch(errore => {
+                clearInterval(intervalloProgresso);
+                contenitoreProgresso.style.display = 'none';
+                mostraErrore(errore.message);
+            });
+        }, 2000);
     }
 
     // Visualizzazione dei dati elaborati
