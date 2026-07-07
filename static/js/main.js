@@ -141,19 +141,19 @@ document.addEventListener('DOMContentLoaded', () => {
             tdRiga.textContent = r.riga;
             tr.appendChild(tdRiga);
 
-            // Colonna Layer
-            const tdLayer = document.createElement('td');
-            tdLayer.className = 'col-layer';
-            tdLayer.textContent = r.layer || "-";
-            tr.appendChild(tdLayer);
+            // Colonna Nome Completo
+            const tdNomeCompleto = document.createElement('td');
+            tdNomeCompleto.className = 'col-layer';
+            tdNomeCompleto.textContent = r.nome_completo || "-";
+            tr.appendChild(tdNomeCompleto);
 
-            // Colonna Nome DB
-            const tdDb = document.createElement('td');
-            tdDb.className = 'col-db';
-            tdDb.textContent = r.nome_db || "-";
-            tr.appendChild(tdDb);
+            // Colonna Nome (layer)
+            const tdNome = document.createElement('td');
+            tdNome.className = 'col-db';
+            tdNome.textContent = r.nome || "-";
+            tr.appendChild(tdNome);
 
-            // Colonna Esito (Status Badge)
+            // Colonna Esito Catalogo (Status Badge)
             const tdEsito = document.createElement('td');
             const spanBadge = document.createElement('span');
             spanBadge.className = `status-badge ${r.esito.toLowerCase()}`;
@@ -161,14 +161,13 @@ document.addEventListener('DOMContentLoaded', () => {
             tdEsito.appendChild(spanBadge);
             tr.appendChild(tdEsito);
 
-            // Colonna Metadato Link
+            // Colonna Catalogo Link
             const tdLink = document.createElement('td');
             tdLink.className = 'col-link';
             if (r.esito === 'YES' && r.link !== 'no') {
                 const a = document.createElement('a');
                 a.href = r.link;
                 a.target = '_blank';
-                // Mostra un testo del link pulito (senza l'intera URL)
                 a.innerHTML = 'Apri Scheda <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>';
                 tdLink.appendChild(a);
                 contatoreTrovati++;
@@ -180,6 +179,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 contatoreNonTrovati++;
             }
             tr.appendChild(tdLink);
+
+            // Colonna Visualizzatore
+            const tdVis = document.createElement('td');
+            if (r.visualizzatore) {
+                const spanVis = document.createElement('span');
+                spanVis.className = `status-badge ${r.visualizzatore.toLowerCase()}`;
+                spanVis.textContent = r.visualizzatore;
+                tdVis.appendChild(spanVis);
+            } else {
+                tdVis.textContent = "-";
+            }
+            tr.appendChild(tdVis);
 
             // Colonna Data Pubblicazione
             const tdPub = document.createElement('td');

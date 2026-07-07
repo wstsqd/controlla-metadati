@@ -398,6 +398,36 @@ def estrai_date_metadato(source_record):
                         
     return formatta_data(data_pub), formatta_data(data_rev)
 
+def determina_visualizzatore(uid, cache=None):
+    """Determina se un progetto è NUOVO o STANDARD in base al suo UID.
+    
+    Controlla l'endpoint crea-progetti/initFile per verificare se il progetto
+    usa il nuovo visualizzatore. Restituisce ('NUOVO', link) o ('STANDARD', link).
+    """
+    if cache is not None and uid in cache:
+        return cache[uid]
+    
+    url_nuovo_json = f"https://rsdi.regione.basilicata.it/crea-progetti/initFile/{uid}.json"
+    url_nuovo_viewer = f"https://rsdi-view.regione.basilicata.it/#https://rsdi.regione.basilicata.it/crea-progetti/initFile/{uid}.json"
+    url_standard = f"https://rsdi.regione.basilicata.it/viewGis/?project={uid}"
+    
+    try:
+        risposta = requests.get(url_nuovo_json, verify=False, timeout=10)
+        if risposta.status_code == 200:
+            contenuto = risposta.text.strip()
+            if contenuto and contenuto != '{}':
+                risultato = ('NUOVO', url_nuovo_viewer)
+                if cache is not None:
+                    cache[uid] = risultato
+                return risultato
+    except Exception as e:
+        print(f"Errore nel controllo visualizzatore per UID {uid}: {e}")
+    
+    risultato = ('STANDARD', url_standard)
+    if cache is not None:
+        cache[uid] = risultato
+    return risultato
+
 
 @app.route('/')
 def home():
@@ -443,19 +473,27 @@ def carica_e_elabora():
         riga_intestazione = [str(cella.value).strip().lower() if cella.value is not None else "" for cella in sheet[1]]
         
         # Mappa dei nomi delle colonne alle posizioni (1-indexed per openpyxl)
+        # Gestione speciale: 'nome' appare due volte (col 2 = nome progetto, col 7 = nome layer)
         mappa_colonne = {}
-        colonne_richieste = ['layer', 'nome_db', 'metadato', 'data pubblicazione', 'data revisione', 'webgis', 'gruppo']
+        colonne_richieste = ['nome_completo', 'catalogo', 'data_pubblicazione', 'data_revisione', 'visualizzatore', 'uid', 'ufficio']
         for col_name in colonne_richieste:
             if col_name in riga_intestazione:
                 mappa_colonne[col_name] = riga_intestazione.index(col_name) + 1
+        
+        # Per la colonna 'nome' (layer), prendi l'ULTIMA occorrenza (col 7, non col 2)
+        indici_nome = [i + 1 for i, val in enumerate(riga_intestazione) if val == 'nome']
+        if len(indici_nome) >= 2:
+            mappa_colonne['nome_layer'] = indici_nome[-1]  # Ultima occorrenza = nome del layer
+        elif len(indici_nome) == 1:
+            mappa_colonne['nome_layer'] = indici_nome[0]
                 
         # Verifica se mancano le colonne critiche di input
-        if 'layer' not in mappa_colonne and 'nome_db' not in mappa_colonne:
-            return jsonify({"errore": "Il file Excel deve contenere almeno le colonne 'layer' o 'nome_db'."}), 400
+        if 'nome_completo' not in mappa_colonne and 'nome_layer' not in mappa_colonne:
+            return jsonify({"errore": "Il file Excel deve contenere almeno le colonne 'nome_completo' o 'nome'."}), 400
             
         # Se mancano le colonne di output, le creiamo in fondo alla tabella
         nuovo_indice_colonna = len(riga_intestazione) + 1
-        for col_name in ['metadato', 'data pubblicazione', 'data revisione']:
+        for col_name in ['catalogo', 'data_pubblicazione', 'data_revisione', 'visualizzatore', 'ufficio']:
             if col_name not in mappa_colonne:
                 sheet.cell(row=1, column=nuovo_indice_colonna, value=col_name)
                 mappa_colonne[col_name] = nuovo_indice_colonna
@@ -464,30 +502,35 @@ def carica_e_elabora():
         # Elaborazione delle righe (dalla riga 2 in poi)
         cronologia_elaborazione = []
         
-        idx_layer = mappa_colonne.get('layer')
-        idx_db = mappa_colonne.get('nome_db')
-        idx_metadato = mappa_colonne.get('metadato')
-        idx_pub = mappa_colonne.get('data pubblicazione')
-        idx_rev = mappa_colonne.get('data revisione')
-        idx_webgis = mappa_colonne.get('webgis')
-        idx_gruppo = mappa_colonne.get('gruppo')
+        idx_nome_completo = mappa_colonne.get('nome_completo')
+        idx_nome_layer = mappa_colonne.get('nome_layer')
+        idx_catalogo = mappa_colonne.get('catalogo')
+        idx_pub = mappa_colonne.get('data_pubblicazione')
+        idx_rev = mappa_colonne.get('data_revisione')
+        idx_visualizzatore = mappa_colonne.get('visualizzatore')
+        idx_uid = mappa_colonne.get('uid')
+        idx_ufficio = mappa_colonne.get('ufficio')
         
         soglia_matching = 80
+        cache_visualizzatore = {}  # Cache per evitare richieste duplicate per lo stesso UID
         
         for riga in range(2, sheet.max_row + 1):
-            valore_layer = sheet.cell(row=riga, column=idx_layer).value if idx_layer else ""
-            valore_db = sheet.cell(row=riga, column=idx_db).value if idx_db else ""
-            valore_webgis = sheet.cell(row=riga, column=idx_webgis).value if idx_webgis else ""
-            valore_gruppo = sheet.cell(row=riga, column=idx_gruppo).value if idx_gruppo else ""
+            valore_nome_completo = sheet.cell(row=riga, column=idx_nome_completo).value if idx_nome_completo else ""
+            valore_nome_layer = sheet.cell(row=riga, column=idx_nome_layer).value if idx_nome_layer else ""
+            valore_uid = sheet.cell(row=riga, column=idx_uid).value if idx_uid else ""
             
             # Se la riga è completamente vuota, la saltiamo
-            if not valore_layer and not valore_db:
+            if not valore_nome_completo and not valore_nome_layer:
                 continue
                 
-            valore_layer_str = str(valore_layer).strip() if valore_layer is not None else ""
-            valore_db_str = str(valore_db).strip() if valore_db is not None else ""
-            valore_webgis_str = str(valore_webgis).strip() if valore_webgis is not None else ""
-            valore_gruppo_str = str(valore_gruppo).strip() if valore_gruppo is not None else ""
+            valore_nome_completo_str = str(valore_nome_completo).strip() if valore_nome_completo is not None else ""
+            valore_nome_layer_str = str(valore_nome_layer).strip() if valore_nome_layer is not None else ""
+            valore_uid_str = str(valore_uid).strip() if valore_uid is not None else ""
+            
+            # Gestione namespace: se il nome contiene ':', prepara anche la versione senza namespace
+            valore_nome_layer_senza_ns = ""
+            if ':' in valore_nome_layer_str:
+                valore_nome_layer_senza_ns = valore_nome_layer_str.split(':', 1)[1]
             
             miglior_record = None
             punteggio_massimo = 0
@@ -515,28 +558,31 @@ def carica_e_elabora():
                     
                 testo_completo = " ".join(source.get('anyText', [])) if isinstance(source.get('anyText'), list) else str(source.get('anyText', ''))
                 
-                score = valuta_corrispondenza(valore_layer_str, valore_db_str, titolo, uuid_sch, identificatore, testo_completo)
+                # Ricerca 1: nome_completo come 'layer', nome_layer come 'nome_db'
+                score = valuta_corrispondenza(valore_nome_completo_str, valore_nome_layer_str, titolo, uuid_sch, identificatore, testo_completo)
                 
-                # Prova con le combinazioni di webgis e gruppo come query alternativa se il punteggio è basso
-                if score < soglia_matching:
-                    if valore_webgis_str and valore_webgis_str.lower() not in ['nan', 'non ci sono gruppi']:
-                        score_web = valuta_corrispondenza(valore_webgis_str, valore_db_str, titolo, uuid_sch, identificatore, testo_completo)
-                        if score_web > score:
-                            score = score_web
-                    if valore_gruppo_str and valore_gruppo_str.lower() not in ['nan', 'non ci sono gruppi']:
-                        score_grp = valuta_corrispondenza(valore_gruppo_str, valore_db_str, titolo, uuid_sch, identificatore, testo_completo)
-                        if score_grp > score:
-                            score = score_grp
+                # Ricerca 2: se il nome_layer contiene ':', prova con la parte dopo i due punti
+                if valore_nome_layer_senza_ns:
+                    score_senza_ns = valuta_corrispondenza(valore_nome_completo_str, valore_nome_layer_senza_ns, titolo, uuid_sch, identificatore, testo_completo)
+                    if score_senza_ns > score:
+                        score = score_senza_ns
                             
                 if score > punteggio_massimo:
                     punteggio_massimo = score
                     miglior_record = scheda
+            
+            # --- Determinazione del Visualizzatore ---
+            tipo_visualizzatore = ""
+            link_visualizzatore = ""
+            if valore_uid_str:
+                tipo_visualizzatore, link_visualizzatore = determina_visualizzatore(valore_uid_str, cache_visualizzatore)
                     
             esito = "NO"
             titolo_trovato = ""
             link_trovato = "no"
             pub_data = ""
             rev_data = ""
+            valore_ufficio = ""
             
             if punteggio_massimo >= soglia_matching:
                 esito = "YES"
@@ -547,25 +593,49 @@ def carica_e_elabora():
                 link_trovato = f"https://rsdi.regione.basilicata.it/geonetwork/srv/ita/catalog.search#/metadata/{uuid_trovato}"
                 pub_data, rev_data = estrai_date_metadato(source)
                 
+                # Estrai l'ufficio dal record (orgForResource o contact)
+                org_list = source.get('orgForResource', source.get('OrgForResource', []))
+                if org_list and isinstance(org_list, list):
+                    # Prendi la prima organizzazione come nome ufficio
+                    primo_org = org_list[0]
+                    if isinstance(primo_org, dict):
+                        valore_ufficio = primo_org.get('default', primo_org.get('langita', ''))
+                    else:
+                        valore_ufficio = str(primo_org)
+                elif isinstance(org_list, str):
+                    valore_ufficio = org_list
+                
                 # Scrittura nel foglio Excel
-                sheet.cell(row=riga, column=idx_metadato, value=link_trovato)
+                sheet.cell(row=riga, column=idx_catalogo, value=link_trovato)
                 sheet.cell(row=riga, column=idx_pub, value=pub_data if pub_data else None)
                 sheet.cell(row=riga, column=idx_rev, value=rev_data if rev_data else None)
+                if idx_ufficio:
+                    sheet.cell(row=riga, column=idx_ufficio, value=valore_ufficio if valore_ufficio else None)
             else:
                 # Nessuna corrispondenza trovata
-                sheet.cell(row=riga, column=idx_metadato, value="no")
+                sheet.cell(row=riga, column=idx_catalogo, value="no")
                 sheet.cell(row=riga, column=idx_pub, value=None)
                 sheet.cell(row=riga, column=idx_rev, value=None)
+                if idx_ufficio:
+                    sheet.cell(row=riga, column=idx_ufficio, value=None)
+            
+            # Scrivi il visualizzatore e sostituisci l'UID con il link
+            if idx_visualizzatore:
+                sheet.cell(row=riga, column=idx_visualizzatore, value=tipo_visualizzatore if tipo_visualizzatore else None)
+            if idx_uid and link_visualizzatore:
+                sheet.cell(row=riga, column=idx_uid, value=link_visualizzatore)
                 
             cronologia_elaborazione.append({
                 "riga": riga,
-                "layer": valore_layer_str,
-                "nome_db": valore_db_str,
+                "nome_completo": valore_nome_completo_str,
+                "nome": valore_nome_layer_str,
                 "esito": esito,
                 "titolo_metadato": titolo_trovato,
                 "link": link_trovato,
                 "pubblicazione": pub_data,
                 "revisione": rev_data,
+                "visualizzatore": tipo_visualizzatore,
+                "ufficio": valore_ufficio,
                 "punteggio": punteggio_massimo
             })
             
@@ -614,14 +684,14 @@ def scarica_file(file_id):
             
             # Identifica gli indici delle colonne basandosi sull'intestazione (riga 1)
             riga_intestazione = [str(cella.value).strip().lower() if cella.value is not None else "" for cella in sheet[1]]
-            idx_metadato = None
-            if 'metadato' in riga_intestazione:
-                idx_metadato = riga_intestazione.index('metadato') + 1
+            idx_catalogo = None
+            if 'catalogo' in riga_intestazione:
+                idx_catalogo = riga_intestazione.index('catalogo') + 1
                 
-            if idx_metadato:
+            if idx_catalogo:
                 font_link = Font(color="0563C1", underline="single")
                 for riga in range(2, sheet.max_row + 1):
-                    cell = sheet.cell(row=riga, column=idx_metadato)
+                    cell = sheet.cell(row=riga, column=idx_catalogo)
                     val = str(cell.value or "").strip()
                     if val.startswith("http://") or val.startswith("https://"):
                         # Assegna l'hyperlink come stringa (preserva l'URL completo con #)

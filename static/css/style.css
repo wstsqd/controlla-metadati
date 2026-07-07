@@ -451,6 +451,16 @@ tr:hover td {
     color: var(--text-secondary);
 }
 
+.status-badge.nuovo {
+    background-color: rgba(0, 113, 227, 0.12);
+    color: var(--accent-blue);
+}
+
+.status-badge.standard {
+    background-color: rgba(134, 134, 139, 0.12);
+    color: var(--text-secondary);
+}
+
 .col-link a {
     color: var(--accent-blue);
     text-decoration: none;
