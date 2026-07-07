@@ -338,6 +338,204 @@ def valuta_corrispondenza(nome_layer, nome_db, titolo_record, uuid_record, ident
         
     return punteggio
 
+def prepara_catalogo(catalogo_raw):
+    """Pre-processa tutte le schede del catalogo UNA SOLA VOLTA.
+    
+    Evita di ricalcolare tokenizzazione, pulizia testo e set di token
+    per ogni confronto (da 2.4M operazioni ridondanti a 600).
+    """
+    risultato = []
+    for scheda in catalogo_raw:
+        source = scheda.get('_source', {})
+        rto = source.get('resourceTitleObject')
+        titolo = rto.get('langita', rto.get('default', '')) if isinstance(rto, dict) else ""
+        if not titolo:
+            continue  # Salta schede senza titolo (non matcheranno mai)
+        
+        uuid_sch = source.get('uuid', '')
+        identificatore = source.get('resourceIdentifier', '')
+        
+        if isinstance(identificatore, list):
+            parti_id = []
+            for item in identificatore:
+                if isinstance(item, dict):
+                    parti_id.extend([str(v) for v in item.values() if v])
+                else:
+                    parti_id.append(str(item))
+            identificatore = " ".join(parti_id)
+        else:
+            identificatore = str(identificatore)
+            
+        testo_completo = " ".join(source.get('anyText', [])) if isinstance(source.get('anyText'), list) else str(source.get('anyText', ''))
+        
+        titolo_pulito = pulisci_testo(titolo)
+        token_titolo_list = ottieni_token(titolo)
+        
+        risultato.append({
+            'scheda': scheda,
+            'source': source,
+            'titolo_pulito': titolo_pulito,
+            'token_titolo_list': token_titolo_list,
+            'token_titolo_set': set(token_titolo_list),   # O(1) lookup
+            'id_minuscolo': identificatore.lower(),
+            'uuid_minuscolo': uuid_sch.lower(),
+            'token_id': set(pulisci_testo(identificatore).split()),
+            'token_uuid': set(pulisci_testo(uuid_sch).split()),
+            'token_testo_completo': set(pulisci_testo(testo_completo).split()),
+        })
+    return risultato
+
+
+def valuta_corrispondenza_veloce(layer_pulito, db_pulito, token_layer, token_db, db_specifico, cat):
+    """Versione ottimizzata di valuta_corrispondenza con dati pre-processati.
+    
+    Parametri pre-calcolati dalla riga:
+        layer_pulito, db_pulito: testi puliti
+        token_layer, token_db: token estratti
+        db_specifico: bool - True se db_pulito è non-generico e non-numerico
+    Parametri pre-calcolati dal catalogo:
+        cat: dict con token_titolo_set, token_id, token_uuid, ecc.
+    """
+    punteggio = 0
+    
+    titolo_pulito = cat['titolo_pulito']
+    token_titolo = cat['token_titolo_set']  # Set per lookup O(1)
+    token_id = cat['token_id']
+    token_uuid = cat['token_uuid']
+    token_testo_completo = cat['token_testo_completo']
+    id_minuscolo = cat['id_minuscolo']
+    uuid_minuscolo = cat['uuid_minuscolo']
+    
+    # Incompatibility check
+    if sono_incompatibili(token_layer, token_db, cat['token_titolo_list']):
+        return 0
+    
+    # 1. Corrispondenza frasale esatta
+    if layer_pulito and titolo_pulito == layer_pulito:
+        punteggio += 300
+    elif layer_pulito and contiene_parola_intera(layer_pulito, titolo_pulito):
+        non_generici = [t for t in token_layer if t not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(t)]
+        punteggio += 150 if non_generici else 40
+            
+    if db_specifico and titolo_pulito == db_pulito:
+        punteggio += 250
+    elif db_specifico and contiene_parola_intera(db_pulito, titolo_pulito):
+        punteggio += 120
+
+    if db_specifico:
+        if db_pulito == id_minuscolo or contiene_parola_intera(db_pulito, id_minuscolo):
+            punteggio += 200
+        if contiene_parola_intera(db_pulito, uuid_minuscolo):
+            punteggio += 180
+
+    # 2. Token matching (con set O(1) invece di list O(n))
+    corr_spec_non_num = 0
+    
+    specifiche_layer_trovate = 0
+    for t in token_layer:
+        generico = t in PAROLE_GENERICHE_GIS
+        numerico = verifica_valore_numerico_o_corto(t)
+        
+        # Cerca nei token del titolo (O(1) con set)
+        trovato_esatto = t in token_titolo
+        trovato_sinonimo = False
+        if not trovato_esatto and t in MAPPA_SINONIMI:
+            for s in MAPPA_SINONIMI[t]:
+                if s in token_titolo:
+                    trovato_sinonimo = True
+                    break
+        
+        if trovato_esatto or trovato_sinonimo:
+            valore = 40 if trovato_esatto else 25
+            if generico:
+                punteggio += 5
+            else:
+                punteggio += valore
+                specifiche_layer_trovate += 1
+                if not numerico:
+                    corr_spec_non_num += 1
+        elif t in token_id or t in token_uuid:
+            if generico:
+                punteggio += 2
+            else:
+                punteggio += 20
+                specifiche_layer_trovate += 1
+                if not numerico:
+                    corr_spec_non_num += 1
+        elif not generico and t in token_testo_completo:
+            punteggio += 3
+                
+    # Token del Database
+    specifiche_db_trovate = 0
+    for t in token_db:
+        if t in PAROLE_GENERICHE_GIS:
+            continue
+        numerico = verifica_valore_numerico_o_corto(t)
+        
+        trovato_esatto = t in token_titolo
+        trovato_sinonimo = False
+        if not trovato_esatto and t in MAPPA_SINONIMI:
+            for s in MAPPA_SINONIMI[t]:
+                if s in token_titolo:
+                    trovato_sinonimo = True
+                    break
+        
+        if trovato_esatto or trovato_sinonimo:
+            valore = 30 if trovato_esatto else 20
+            punteggio += valore
+            specifiche_db_trovate += 1
+            if not numerico:
+                corr_spec_non_num += 1
+        elif t in token_id or t in token_uuid:
+            punteggio += 50
+            specifiche_db_trovate += 1
+            if not numerico:
+                corr_spec_non_num += 1
+        elif t in token_testo_completo:
+            punteggio += 3
+
+    # 3. Bonus completamento
+    spec_layer_rich = [t for t in token_layer if t not in PAROLE_GENERICHE_GIS]
+    if spec_layer_rich and specifiche_layer_trovate == len(spec_layer_rich):
+        punteggio += 50
+    spec_db_rich = [t for t in token_db if t not in PAROLE_GENERICHE_GIS]
+    if spec_db_rich and specifiche_db_trovate == len(spec_db_rich):
+        punteggio += 50
+
+    # 4. Tie-breaker
+    if layer_pulito and titolo_pulito.startswith(layer_pulito):
+        punteggio += 10
+    elif db_pulito and titolo_pulito.startswith(db_pulito):
+        punteggio += 10
+
+    # Regole critiche
+    spec_rich_tot = [t for t in (token_layer + token_db) if t not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(t)]
+    if spec_rich_tot and corr_spec_non_num == 0:
+        return 0
+    
+    tot_spec = len(spec_rich_tot)
+    if tot_spec >= 2 and corr_spec_non_num < max(1, tot_spec // 2):
+        punteggio = punteggio // 3
+    
+    token_tutti = [t for t in (token_layer + token_db) if t not in PAROLE_GENERICHE_GIS]
+    token_non_num = [t for t in token_tutti if not verifica_valore_numerico_o_corto(t)]
+    if token_tutti and not token_non_num:
+        token_contesto = [t for t in (token_layer + token_db) if t in PAROLE_GENERICHE_GIS]
+        if token_contesto:
+            if not any(t in token_titolo for t in token_contesto):
+                return 0
+        if not token_contesto:
+            punteggio = punteggio // 4
+    
+    if db_pulito:
+        numeri_nel_db = [t for t in db_pulito.split() if t.isdigit()]
+        if numeri_nel_db:
+            parole_titolo = set(titolo_pulito.split())
+            if sum(1 for n in numeri_nel_db if n in parole_titolo) == 0:
+                punteggio = punteggio // 4
+        
+    return punteggio
+
 def scarica_catalogo_rsdi():
     """Scarica l'elenco completo dei metadati dal catalogo RSDI Basilicata."""
     payload = {
@@ -569,13 +767,20 @@ def elabora_in_background(job_id, percorso_upload, percorso_elaborato, nome_salv
                 uid_unici.add(str(valore_uid).strip())
         cache_visualizzatore = precarica_visualizzatori(uid_unici)
         
+        jobs[job_id]['progress'] = 35
+        jobs[job_id]['messaggio'] = 'Pre-elaborazione catalogo...'
+        
+        # Pre-processa il catalogo UNA SOLA VOLTA (elimina 2.4M tokenizzazioni ridondanti)
+        catalogo_pre = prepara_catalogo(catalogo)
+        print(f"Catalogo pre-processato: {len(catalogo_pre)} schede valide")
+        
         jobs[job_id]['progress'] = 40
         jobs[job_id]['messaggio'] = 'Analisi e confronto con il catalogo...'
         
         # Elaborazione righe
         cronologia_elaborazione = []
         soglia_matching = 80
-        righe_totali = sheet.max_row - 1  # escludi header
+        righe_totali = sheet.max_row - 1
         
         for idx_riga, riga in enumerate(range(2, sheet.max_row + 1)):
             valore_nome_completo = sheet.cell(row=riga, column=idx_nome_completo).value if idx_nome_completo else ""
@@ -589,47 +794,38 @@ def elabora_in_background(job_id, percorso_upload, percorso_elaborato, nome_salv
             valore_nome_layer_str = str(valore_nome_layer).strip() if valore_nome_layer is not None else ""
             valore_uid_str = str(valore_uid).strip() if valore_uid is not None else ""
             
-            # Gestione namespace
-            valore_nome_layer_senza_ns = ""
+            # Pre-computa dati della riga UNA SOLA VOLTA (non 600 volte)
+            layer_pulito = pulisci_testo(valore_nome_completo_str)
+            db_pulito = pulisci_testo(valore_nome_layer_str)
+            token_layer = ottieni_token(valore_nome_completo_str)
+            token_db = ottieni_token(valore_nome_layer_str)
+            db_specifico = bool(db_pulito and db_pulito not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(db_pulito))
+            
+            # Gestione namespace: pre-computa anche versione senza namespace
+            db_pulito_senza_ns = ""
+            token_db_senza_ns = []
+            db_specifico_senza_ns = False
             if ':' in valore_nome_layer_str:
-                valore_nome_layer_senza_ns = valore_nome_layer_str.split(':', 1)[1]
+                nome_senza_ns = valore_nome_layer_str.split(':', 1)[1]
+                db_pulito_senza_ns = pulisci_testo(nome_senza_ns)
+                token_db_senza_ns = ottieni_token(nome_senza_ns)
+                db_specifico_senza_ns = bool(db_pulito_senza_ns and db_pulito_senza_ns not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(db_pulito_senza_ns))
             
             miglior_record = None
             punteggio_massimo = 0
             
-            for scheda in catalogo:
-                source = scheda.get('_source', {})
-                rto = source.get('resourceTitleObject')
-                if isinstance(rto, dict):
-                    titolo = rto.get('langita', rto.get('default', ''))
-                else:
-                    titolo = ""
-                uuid_sch = source.get('uuid', '')
-                identificatore = source.get('resourceIdentifier', '')
+            # Loop interno: usa dati pre-processati (nessuna tokenizzazione)
+            for cat in catalogo_pre:
+                score = valuta_corrispondenza_veloce(layer_pulito, db_pulito, token_layer, token_db, db_specifico, cat)
                 
-                if isinstance(identificatore, list):
-                    parti_id = []
-                    for item in identificatore:
-                        if isinstance(item, dict):
-                            parti_id.extend([str(v) for v in item.values() if v])
-                        else:
-                            parti_id.append(str(item))
-                    identificatore = " ".join(parti_id)
-                else:
-                    identificatore = str(identificatore)
-                    
-                testo_completo = " ".join(source.get('anyText', [])) if isinstance(source.get('anyText'), list) else str(source.get('anyText', ''))
-                
-                score = valuta_corrispondenza(valore_nome_completo_str, valore_nome_layer_str, titolo, uuid_sch, identificatore, testo_completo)
-                
-                if valore_nome_layer_senza_ns:
-                    score_senza_ns = valuta_corrispondenza(valore_nome_completo_str, valore_nome_layer_senza_ns, titolo, uuid_sch, identificatore, testo_completo)
-                    if score_senza_ns > score:
-                        score = score_senza_ns
+                if db_pulito_senza_ns:
+                    score_ns = valuta_corrispondenza_veloce(layer_pulito, db_pulito_senza_ns, token_layer, token_db_senza_ns, db_specifico_senza_ns, cat)
+                    if score_ns > score:
+                        score = score_ns
                             
                 if score > punteggio_massimo:
                     punteggio_massimo = score
-                    miglior_record = scheda
+                    miglior_record = cat['scheda']
             
             # Visualizzatore
             tipo_visualizzatore = ""
