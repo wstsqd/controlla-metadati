@@ -44,7 +44,11 @@ PAROLE_GENERICHE_GIS = {
     'area', 'aree', 'zona', 'zone', 'mappa', 'mappe', 'carta', 'carte', 'punti', 'punto', 'linea', 'linee', 
     'poligono', 'poligoni', 'servizio', 'servizi', 'dati', 'dato', 'db', 'dbgt', 'basilicata', 'regione', 
     'provincia', 'provincie', 'comune', 'comuni', 'limiti', 'limite', 'confini', 'confine', 'wms', 'wfs', 
-    'raster', 'vettoriale', 'shapefile', 'vista', 'volumi', 'nan', 'vigente', 'vigente1', 'vigente2', 'vigente3'
+    'raster', 'vettoriale', 'shapefile', 'vista', 'volumi', 'nan', 'vigente', 'vigente1', 'vigente2', 'vigente3',
+    # Termini amministrativi/legali troppo comuni (causano falsi positivi)
+    'art', 'articolo', 'dlgs', 'decreto', 'legge', 'norma', 'norme', 'piano',
+    'base', 'tipo', 'generale', 'speciale', 'urbano', 'urbana', 'nazionale', 'regionale',
+    'anno', 'numero', 'num', 'cod', 'codice',
 }
 
 # Parole vuote in italiano da escludere (comprensive di articoli e preposizioni semplici e articolate)
@@ -472,7 +476,7 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
     if layer_pulito and titolo_pulito == layer_pulito:
         punteggio += 300
     elif layer_pulito and contiene_parola_intera(layer_pulito, titolo_pulito):
-        punteggio += 150 if ctx['non_generici_layer'] else 40
+        punteggio += 150 if ctx['non_generici_layer'] else 10
             
     if db_specifico and titolo_pulito == db_pulito:
         punteggio += 250
@@ -574,6 +578,28 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
         parole_titolo = set(titolo_pulito.split())
         if sum(1 for n in ctx['numeri_nel_db'] if n in parole_titolo) == 0:
             punteggio = punteggio // 4
+    
+    # REGOLA CRITICA 5: Se il nome DB ha token specifici ma NESSUNO corrisponde
+    # al titolo/id/uuid del catalogo, il match è basato solo su nome_completo
+    # e molto probabilmente è un falso positivo.
+    if ctx['spec_db_rich_len'] > 0 and specifiche_db_trovate == 0:
+        punteggio = punteggio // 5
+    
+    # REGOLA CRITICA 6: Se il nome DB ha >= 2 token specifici ma meno della metà
+    # corrisponde, il match è parziale e inaffidabile.
+    if ctx['spec_db_rich_len'] >= 2 and specifiche_db_trovate < max(1, ctx['spec_db_rich_len'] // 2):
+        punteggio = punteggio // 3
+    
+    # REGOLA CRITICA 7: Un singolo token che matcha (es. "incendi" -> "aree percorse dal fuoco")
+    # non è sufficiente per confermare un match. Servono almeno 2 corrispondenze 
+    # specifiche non-numeriche per avere un match affidabile.
+    if corr_spec_non_num == 1 and punteggio < 250:
+        punteggio = punteggio // 3
+    
+    # REGOLA CRITICA 8: Se NESSUN token specifico non-numerico è stato trovato
+    # e il punteggio è basato solo su parole generiche/contesto, il match è inaffidabile.
+    if corr_spec_non_num == 0:
+        punteggio = 0
         
     return punteggio
 
