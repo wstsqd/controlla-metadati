@@ -386,6 +386,37 @@ def prepara_catalogo(catalogo_raw):
     return risultato
 
 
+def costruisci_indice_inverso(catalogo_pre):
+    """Costruisce un indice inverso: token → set di indici delle schede.
+    
+    Permette di trovare rapidamente solo le schede candidate che condividono
+    almeno un token con la query, riducendo i confronti da 302 a ~20-50 per query.
+    """
+    indice = {}
+    for idx, cat in enumerate(catalogo_pre):
+        # Includi token da titolo, id e uuid (non full text - troppo generico)
+        tutti_token = cat['token_titolo_set'] | cat['token_id'] | cat['token_uuid']
+        for token in tutti_token:
+            if token not in indice:
+                indice[token] = set()
+            indice[token].add(idx)
+    return indice
+
+
+def trova_candidati(token_layer, token_db, indice_inverso):
+    """Trova gli indici delle schede candidate che condividono almeno un token."""
+    candidati = set()
+    for t in token_layer + token_db:
+        if t in indice_inverso:
+            candidati.update(indice_inverso[t])
+        # Controlla anche i sinonimi
+        if t in MAPPA_SINONIMI:
+            for s in MAPPA_SINONIMI[t]:
+                if s in indice_inverso:
+                    candidati.update(indice_inverso[s])
+    return candidati
+
+
 def prepara_contesto_riga(layer_pulito, db_pulito, token_layer, token_db):
     """Pre-calcola i valori derivati dalla riga che non cambiano tra le schede del catalogo.
     Questi venivano ricalcolati 302 volte per riga (1 per ogni scheda), ora solo 1 volta."""
@@ -663,7 +694,7 @@ def _controlla_singolo_uid(uid):
     url_standard = f"https://rsdi.regione.basilicata.it/viewGis/?project={uid}"
     
     try:
-        risposta = requests.get(url_nuovo_json, verify=False, timeout=8)
+        risposta = requests.get(url_nuovo_json, verify=False, timeout=5)
         if risposta.status_code == 200:
             contenuto = risposta.text.strip()
             if contenuto and contenuto != '{}':
@@ -684,7 +715,7 @@ def precarica_visualizzatori(lista_uid):
         return cache
     
     print(f"Controllo visualizzatore per {len(lista_uid)} UID univoci in parallelo...")
-    with ThreadPoolExecutor(max_workers=25) as executor:
+    with ThreadPoolExecutor(max_workers=50) as executor:
         futures = {executor.submit(_controlla_singolo_uid, uid): uid for uid in lista_uid}
         for future in as_completed(futures):
             try:
@@ -827,16 +858,17 @@ def elabora_in_background(job_id, percorso_upload, percorso_elaborato, nome_salv
         
         # Pre-processa il catalogo UNA SOLA VOLTA (elimina 2.4M tokenizzazioni ridondanti)
         catalogo_pre = prepara_catalogo(catalogo)
-        print(f"Catalogo pre-processato: {len(catalogo_pre)} schede valide")
+        indice_inverso = costruisci_indice_inverso(catalogo_pre)
+        print(f"Catalogo pre-processato: {len(catalogo_pre)} schede, {len(indice_inverso)} token nell'indice")
         
         jobs[job_id]['progress'] = 40
         jobs[job_id]['messaggio'] = 'Analisi e confronto con il catalogo...'
         
-        # Elaborazione righe con cache per query duplicate (37% delle righe)
+        # Elaborazione righe con cache + indice inverso
         cronologia_elaborazione = []
         soglia_matching = 80
         righe_totali = sheet.max_row - 1
-        cache_query = {}  # {(nome_completo, nome): (punteggio, scheda)}
+        cache_query = {}
         
         for idx_riga, riga in enumerate(range(2, sheet.max_row + 1)):
             valore_nome_completo = sheet.cell(row=riga, column=idx_nome_completo).value if idx_nome_completo else ""
@@ -850,12 +882,10 @@ def elabora_in_background(job_id, percorso_upload, percorso_elaborato, nome_salv
             valore_nome_layer_str = str(valore_nome_layer).strip() if valore_nome_layer is not None else ""
             valore_uid_str = str(valore_uid).strip() if valore_uid is not None else ""
             
-            # Cache: se la stessa query è già stata processata, riusa il risultato
             chiave_query = (valore_nome_completo_str, valore_nome_layer_str)
             if chiave_query in cache_query:
                 punteggio_massimo, miglior_record = cache_query[chiave_query]
             else:
-                # Pre-computa dati della riga
                 layer_pulito = pulisci_testo(valore_nome_completo_str)
                 db_pulito = pulisci_testo(valore_nome_layer_str)
                 token_layer = ottieni_token(valore_nome_completo_str)
@@ -863,10 +893,10 @@ def elabora_in_background(job_id, percorso_upload, percorso_elaborato, nome_salv
                 db_specifico = bool(db_pulito and db_pulito not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(db_pulito))
                 ctx = prepara_contesto_riga(layer_pulito, db_pulito, token_layer, token_db)
                 
-                # Gestione namespace
                 db_pulito_senza_ns = ""
                 ctx_senza_ns = None
                 db_specifico_senza_ns = False
+                token_db_senza_ns = []
                 if ':' in valore_nome_layer_str:
                     nome_senza_ns = valore_nome_layer_str.split(':', 1)[1]
                     db_pulito_senza_ns = pulisci_testo(nome_senza_ns)
@@ -874,10 +904,16 @@ def elabora_in_background(job_id, percorso_upload, percorso_elaborato, nome_salv
                     db_specifico_senza_ns = bool(db_pulito_senza_ns and db_pulito_senza_ns not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(db_pulito_senza_ns))
                     ctx_senza_ns = prepara_contesto_riga(layer_pulito, db_pulito_senza_ns, token_layer, token_db_senza_ns)
                 
+                # Indice inverso: cerca solo le schede candidate (non tutte le 302)
+                candidati = trova_candidati(token_layer, token_db, indice_inverso)
+                if token_db_senza_ns:
+                    candidati |= trova_candidati(token_layer, token_db_senza_ns, indice_inverso)
+                
                 miglior_record = None
                 punteggio_massimo = 0
                 
-                for cat in catalogo_pre:
+                for idx in candidati:
+                    cat = catalogo_pre[idx]
                     score = valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat)
                     
                     if db_pulito_senza_ns:
