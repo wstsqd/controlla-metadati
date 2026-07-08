@@ -927,7 +927,21 @@ def elabora_in_background(job_id, percorso_upload, percorso_elaborato, nome_salv
         # Pre-processa il catalogo UNA SOLA VOLTA (elimina 2.4M tokenizzazioni ridondanti)
         catalogo_pre = prepara_catalogo(catalogo)
         indice_inverso = costruisci_indice_inverso(catalogo_pre)
-        print(f"Catalogo pre-processato: {len(catalogo_pre)} schede, {len(indice_inverso)} token nell'indice")
+        
+        # Mappa per match deterministici/esatti (O(1))
+        mappa_identificatori = {}
+        for cat in catalogo_pre:
+            uuid = cat['uuid_minuscolo']
+            identificatore = cat['id_minuscolo']
+            if uuid:
+                mappa_identificatori[uuid] = cat
+            if identificatore:
+                mappa_identificatori[identificatore] = cat
+                if ':' in identificatore:
+                    parti = identificatore.split(':')
+                    mappa_identificatori[parti[-1]] = cat
+                    
+        print(f"Catalogo pre-processato: {len(catalogo_pre)} schede, {len(indice_inverso)} token nell'indice, {len(mappa_identificatori)} identificatori unici")
         
         jobs[job_id]['progress'] = 40
         jobs[job_id]['messaggio'] = 'Analisi e confronto con il catalogo...'
@@ -954,44 +968,71 @@ def elabora_in_background(job_id, percorso_upload, percorso_elaborato, nome_salv
             if chiave_query in cache_query:
                 punteggio_massimo, miglior_record = cache_query[chiave_query]
             else:
-                layer_pulito = pulisci_testo(valore_nome_completo_str)
-                db_pulito = pulisci_testo(valore_nome_layer_str)
-                token_layer = ottieni_token(valore_nome_completo_str)
-                token_db = ottieni_token(valore_nome_layer_str)
-                db_specifico = bool(db_pulito and db_pulito not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(db_pulito))
-                ctx = prepara_contesto_riga(layer_pulito, db_pulito, token_layer, token_db)
+                # 1. Prova prima il match deterministico/esatto sul nome (DB layer)
+                scheda_esatta = None
+                nl_lower = valore_nome_layer_str.lower()
+                nc_lower = valore_nome_completo_str.lower()
                 
-                db_pulito_senza_ns = ""
-                ctx_senza_ns = None
-                db_specifico_senza_ns = False
-                token_db_senza_ns = []
-                if ':' in valore_nome_layer_str:
-                    nome_senza_ns = valore_nome_layer_str.split(':', 1)[1]
-                    db_pulito_senza_ns = pulisci_testo(nome_senza_ns)
-                    token_db_senza_ns = ottieni_token(nome_senza_ns)
-                    db_specifico_senza_ns = bool(db_pulito_senza_ns and db_pulito_senza_ns not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(db_pulito_senza_ns))
-                    ctx_senza_ns = prepara_contesto_riga(layer_pulito, db_pulito_senza_ns, token_layer, token_db_senza_ns)
+                # Cerca prima per nome layer
+                if nl_lower and nl_lower in mappa_identificatori:
+                    scheda_esatta = mappa_identificatori[nl_lower]
+                elif nl_lower and ':' in nl_lower:
+                    parte_senza_ns = nl_lower.split(':')[-1]
+                    if parte_senza_ns in mappa_identificatori:
+                        scheda_esatta = mappa_identificatori[parte_senza_ns]
                 
-                # Indice inverso: cerca solo le schede candidate (non tutte le 302)
-                candidati = trova_candidati(token_layer, token_db, indice_inverso)
-                if token_db_senza_ns:
-                    candidati |= trova_candidati(token_layer, token_db_senza_ns, indice_inverso)
+                # Se non trovato, cerca per nome completo
+                if not scheda_esatta:
+                    if nc_lower and nc_lower in mappa_identificatori:
+                        scheda_esatta = mappa_identificatori[nc_lower]
+                    elif nc_lower and ':' in nc_lower:
+                        parte_senza_ns = nc_lower.split(':')[-1]
+                        if parte_senza_ns in mappa_identificatori:
+                            scheda_esatta = mappa_identificatori[parte_senza_ns]
                 
-                miglior_record = None
-                punteggio_massimo = 0
-                
-                for idx in candidati:
-                    cat = catalogo_pre[idx]
-                    score = valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat)
+                if scheda_esatta:
+                    punteggio_massimo = 500
+                    miglior_record = scheda_esatta['scheda']
+                else:
+                    # 2. Altrimenti, procedi con il matching euristico/semantico
+                    layer_pulito = pulisci_testo(valore_nome_completo_str)
+                    db_pulito = pulisci_testo(valore_nome_layer_str)
+                    token_layer = ottieni_token(valore_nome_completo_str)
+                    token_db = ottieni_token(valore_nome_layer_str)
+                    db_specifico = bool(db_pulito and db_pulito not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(db_pulito))
+                    ctx = prepara_contesto_riga(layer_pulito, db_pulito, token_layer, token_db)
                     
-                    if db_pulito_senza_ns:
-                        score_ns = valuta_corrispondenza_veloce(layer_pulito, db_pulito_senza_ns, db_specifico_senza_ns, ctx_senza_ns, cat)
-                        if score_ns > score:
-                            score = score_ns
-                                
-                    if score > punteggio_massimo:
-                        punteggio_massimo = score
-                        miglior_record = cat['scheda']
+                    db_pulito_senza_ns = ""
+                    ctx_senza_ns = None
+                    db_specifico_senza_ns = False
+                    token_db_senza_ns = []
+                    if ':' in valore_nome_layer_str:
+                        nome_senza_ns = valore_nome_layer_str.split(':', 1)[1]
+                        db_pulito_senza_ns = pulisci_testo(nome_senza_ns)
+                        token_db_senza_ns = ottieni_token(nome_senza_ns)
+                        db_specifico_senza_ns = bool(db_pulito_senza_ns and db_pulito_senza_ns not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(db_pulito_senza_ns))
+                        ctx_senza_ns = prepara_contesto_riga(layer_pulito, db_pulito_senza_ns, token_layer, token_db_senza_ns)
+                    
+                    # Indice inverso: cerca solo le schede candidate (non tutte le 302)
+                    candidati = trova_candidati(token_layer, token_db, indice_inverso)
+                    if token_db_senza_ns:
+                        candidati |= trova_candidati(token_layer, token_db_senza_ns, indice_inverso)
+                    
+                    miglior_record = None
+                    punteggio_massimo = 0
+                    
+                    for idx in candidati:
+                        cat = catalogo_pre[idx]
+                        score = valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat)
+                        
+                        if db_pulito_senza_ns:
+                            score_ns = valuta_corrispondenza_veloce(layer_pulito, db_pulito_senza_ns, db_specifico_senza_ns, ctx_senza_ns, cat)
+                            if score_ns > score:
+                                score = score_ns
+                                    
+                        if score > punteggio_massimo:
+                            punteggio_massimo = score
+                            miglior_record = cat['scheda']
                 
                 cache_query[chiave_query] = (punteggio_massimo, miglior_record)
             
