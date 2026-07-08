@@ -510,7 +510,7 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
             punteggio += 180
 
     # 2. Token matching (con set O(1))
-    set_corr_spec_non_num = set()
+    corr_spec_non_num = 0
     
     specifiche_layer_trovate = 0
     for t, generico, numerico in ctx['token_layer_info']:
@@ -530,7 +530,7 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
                 punteggio += valore
                 specifiche_layer_trovate += 1
                 if not numerico:
-                    set_corr_spec_non_num.add(t)
+                    corr_spec_non_num += 1
         elif t in token_id or t in token_uuid:
             if generico:
                 punteggio += 2
@@ -538,7 +538,7 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
                 punteggio += 20
                 specifiche_layer_trovate += 1
                 if not numerico:
-                    set_corr_spec_non_num.add(t)
+                    corr_spec_non_num += 1
         elif not generico and t in token_testo_completo:
             punteggio += 3
                 
@@ -558,16 +558,14 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
             punteggio += valore
             specifiche_db_trovate += 1
             if not numerico:
-                set_corr_spec_non_num.add(t)
+                corr_spec_non_num += 1
         elif t in token_id or t in token_uuid:
             punteggio += 50
             specifiche_db_trovate += 1
             if not numerico:
-                set_corr_spec_non_num.add(t)
+                corr_spec_non_num += 1
         elif t in token_testo_completo:
             punteggio += 3
-            
-    corr_spec_non_num = len(set_corr_spec_non_num)
 
     # 3. Bonus completamento (usa valori pre-calcolati)
     if ctx['spec_layer_rich_len'] and specifiche_layer_trovate == ctx['spec_layer_rich_len']:
@@ -609,11 +607,14 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
     
     # REGOLA CRITICA 6: Se il nome DB ha >= 2 token specifici ma meno della metà
     # corrisponde, il match è parziale e inaffidabile.
-    if ctx['spec_db_rich_len'] >= 2 and specifiche_db_trovate < (ctx['spec_db_rich_len'] + 1) // 2:
+    if ctx['spec_db_rich_len'] >= 2 and specifiche_db_trovate < max(1, ctx['spec_db_rich_len'] // 2):
         punteggio = punteggio // 3
     
-    # REGOLA CRITICA 7: Un singolo token che matcha non è sufficiente
-    if corr_spec_non_num == 1 and punteggio < 300:
+    # REGOLA CRITICA 7: Un singolo token specifico non-numerico trovato non è sufficiente
+    # solo se la query in totale conteneva PIÙ di 1 token specifico. Se l'utente ha cercato
+    # una sola parola specifica, trovare quella parola è un match perfetto e non va penalizzato.
+    tot_spec_unici_query = len(set(ctx['spec_rich_tot']))
+    if corr_spec_non_num == 1 and tot_spec_unici_query > 1 and punteggio < 300:
         punteggio = punteggio // 4
     
     # REGOLA CRITICA 8: Nessun token specifico = no match
