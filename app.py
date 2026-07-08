@@ -51,6 +51,8 @@ PAROLE_GENERICHE_GIS = {
     'anno', 'numero', 'num', 'cod', 'codice',
     # Parole test/esempio che indicano dati di prova
     'esempio', 'test', 'prova', 'sample', 'demo', 'tmp', 'temp',
+    # Parole generiche di sezioni catastali, censuarie o di disegno
+    'sezione', 'sezioni',
 }
 
 # Parole vuote in italiano da escludere (comprensive di articoli e preposizioni semplici e articolate)
@@ -508,7 +510,7 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
             punteggio += 180
 
     # 2. Token matching (con set O(1))
-    corr_spec_non_num = 0
+    set_corr_spec_non_num = set()
     
     specifiche_layer_trovate = 0
     for t, generico, numerico in ctx['token_layer_info']:
@@ -528,7 +530,7 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
                 punteggio += valore
                 specifiche_layer_trovate += 1
                 if not numerico:
-                    corr_spec_non_num += 1
+                    set_corr_spec_non_num.add(t)
         elif t in token_id or t in token_uuid:
             if generico:
                 punteggio += 2
@@ -536,7 +538,7 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
                 punteggio += 20
                 specifiche_layer_trovate += 1
                 if not numerico:
-                    corr_spec_non_num += 1
+                    set_corr_spec_non_num.add(t)
         elif not generico and t in token_testo_completo:
             punteggio += 3
                 
@@ -556,14 +558,16 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
             punteggio += valore
             specifiche_db_trovate += 1
             if not numerico:
-                corr_spec_non_num += 1
+                set_corr_spec_non_num.add(t)
         elif t in token_id or t in token_uuid:
             punteggio += 50
             specifiche_db_trovate += 1
             if not numerico:
-                corr_spec_non_num += 1
+                set_corr_spec_non_num.add(t)
         elif t in token_testo_completo:
             punteggio += 3
+            
+    corr_spec_non_num = len(set_corr_spec_non_num)
 
     # 3. Bonus completamento (usa valori pre-calcolati)
     if ctx['spec_layer_rich_len'] and specifiche_layer_trovate == ctx['spec_layer_rich_len']:
@@ -605,7 +609,7 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
     
     # REGOLA CRITICA 6: Se il nome DB ha >= 2 token specifici ma meno della metà
     # corrisponde, il match è parziale e inaffidabile.
-    if ctx['spec_db_rich_len'] >= 2 and specifiche_db_trovate < max(1, ctx['spec_db_rich_len'] // 2):
+    if ctx['spec_db_rich_len'] >= 2 and specifiche_db_trovate < (ctx['spec_db_rich_len'] + 1) // 2:
         punteggio = punteggio // 3
     
     # REGOLA CRITICA 7: Un singolo token che matcha non è sufficiente
