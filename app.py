@@ -53,6 +53,16 @@ PAROLE_GENERICHE_GIS = {
     'esempio', 'test', 'prova', 'sample', 'demo', 'tmp', 'temp',
     # Parole generiche di sezioni catastali, censuarie o di disegno
     'sezione', 'sezioni',
+    # Comuni della Basilicata e termini territoriali (evita di penalizzare i match su dati regionali)
+    'accettura', 'irsina', 'lagonegro', 'lavello', 'melfi', 'montescaglioso', 'rionero', 'salandra', 'venosa', 
+    'brienza', 'sasso', 'castalda', 'tramutola', 'tito', 'pignola', 'tricarico', 'scanzano', 'ferrandina', 
+    'pisticci', 'potenza', 'matera', 'rotonda', 'viggiano', 'marsico', 'avigliano', 'ruoti', 'bella', 'muro', 
+    'tursi', 'policoro', 'senise', 'noepoli', 'stigliano', 'gorgoglione', 'aliano', 'calciano', 'garaguso', 
+    'grassano', 'grottole', 'miglionico', 'pomarico', 'valsinni', 'nova', 'siri', 'oppido', 'tolve', 'forenza', 
+    'acerenza', 'palazzo', 'rapolla', 'atella', 'barile', 'ripacandida', 'filiano', 'lauria', 'maratea', 
+    'pietragalla', 'moliterno', 'laurenzana', 'corleto', 'anzi', 'abriola', 'calvello', 'satriano', 'trivigno', 
+    'albano', 'castelmezzano', 'pietrapertosa', 'campomaggiore', 'cirigliano', 'bernalda', 'montalbano',
+    'comunale', 'comunali', 'territoriale', 'territoriali', 'provinciale', 'provinciali',
 }
 
 # Parole vuote in italiano da escludere (comprensive di articoli e preposizioni semplici e articolate)
