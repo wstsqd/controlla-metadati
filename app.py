@@ -49,6 +49,8 @@ PAROLE_GENERICHE_GIS = {
     'art', 'articolo', 'dlgs', 'decreto', 'legge', 'norma', 'norme', 'piano',
     'base', 'tipo', 'generale', 'speciale', 'urbano', 'urbana', 'nazionale', 'regionale',
     'anno', 'numero', 'num', 'cod', 'codice',
+    # Parole test/esempio che indicano dati di prova
+    'esempio', 'test', 'prova', 'sample', 'demo', 'tmp', 'temp',
 }
 
 # Parole vuote in italiano da escludere (comprensive di articoli e preposizioni semplici e articolate)
@@ -438,6 +440,19 @@ def prepara_contesto_riga(layer_pulito, db_pulito, token_layer, token_db):
     token_layer_info = [(t, t in PAROLE_GENERICHE_GIS, verifica_valore_numerico_o_corto(t)) for t in token_layer]
     token_db_info = [(t, verifica_valore_numerico_o_corto(t)) for t in token_db if t not in PAROLE_GENERICHE_GIS]
     
+    # Set espanso dei token query (include sinonimi) per il check copertura titolo
+    query_tokens_expanded = set()
+    for t in spec_rich_tot:
+        query_tokens_expanded.add(t)
+        if t in MAPPA_SINONIMI:
+            query_tokens_expanded.update(MAPPA_SINONIMI[t])
+            
+    # Controlla se la query contiene parole di test/esempio
+    test_tokens_query = {t for t in combined if t in {'esempio', 'test', 'prova', 'sample', 'demo', 'temp', 'tmp'}}
+    
+    # Controlla se la query contiene un anno
+    ha_anno_query = any(t.isdigit() and len(t) == 4 and 1900 <= int(t) <= 2099 for t in combined)
+    
     return {
         'spec_layer_rich_len': len(spec_layer_rich),
         'spec_db_rich_len': len(spec_db_rich),
@@ -449,6 +464,9 @@ def prepara_contesto_riga(layer_pulito, db_pulito, token_layer, token_db):
         'numeri_nel_db': numeri_nel_db,
         'token_layer_info': token_layer_info,
         'token_db_info': token_db_info,
+        'query_tokens_expanded': query_tokens_expanded,
+        'test_tokens_query': test_tokens_query,
+        'ha_anno_query': ha_anno_query,
     }
 
 
@@ -590,16 +608,40 @@ def valuta_corrispondenza_veloce(layer_pulito, db_pulito, db_specifico, ctx, cat
     if ctx['spec_db_rich_len'] >= 2 and specifiche_db_trovate < max(1, ctx['spec_db_rich_len'] // 2):
         punteggio = punteggio // 3
     
-    # REGOLA CRITICA 7: Un singolo token che matcha (es. "incendi" -> "aree percorse dal fuoco")
-    # non è sufficiente per confermare un match. Servono almeno 2 corrispondenze 
-    # specifiche non-numeriche per avere un match affidabile.
-    if corr_spec_non_num == 1 and punteggio < 250:
-        punteggio = punteggio // 3
+    # REGOLA CRITICA 7: Un singolo token che matcha non è sufficiente
+    if corr_spec_non_num == 1 and punteggio < 300:
+        punteggio = punteggio // 4
     
-    # REGOLA CRITICA 8: Se NESSUN token specifico non-numerico è stato trovato
-    # e il punteggio è basato solo su parole generiche/contesto, il match è inaffidabile.
+    # REGOLA CRITICA 8: Nessun token specifico = no match
     if corr_spec_non_num == 0:
         punteggio = 0
+    
+    # REGOLA CRITICA 9: Rilevamento copertura rimosso perché troppo severo su titoli molto lunghi 
+    # e burocratici (es. beni paesaggistici). Rimane la Regola 12 sulla penalità di lunghezza.
+    titolo_tokens_spec = [t for t in token_titolo 
+                          if t not in PAROLE_GENERICHE_GIS and not verifica_valore_numerico_o_corto(t)]
+            
+    # REGOLA CRITICA 10: Se la query contiene parole di test/esempio (es. "esempio", "test")
+    # ma la scheda del catalogo non le contiene, azzeriamo il match.
+    if ctx['test_tokens_query']:
+        if not any(t in token_titolo for t in ctx['test_tokens_query']):
+            return 0
+            
+    # REGOLA CRITICA 11: Se la scheda del catalogo si riferisce a un anno specifico
+    # (es. 2006, 2007) ma la query non richiede alcun anno, penalizziamo leggermente il match
+    # per favorire schede generiche, ma senza escludere se è l'unica scheda disponibile (es. CTR 2013).
+    if ctx['ha_anno_query'] is False:
+        anni_titolo = [t for t in token_titolo if t.isdigit() and len(t) == 4 and 1900 <= int(t) <= 2099]
+        if anni_titolo:
+            punteggio = int(punteggio // 1.5)
+            
+    # REGOLA CRITICA 12: Penalità di lunghezza del titolo.
+    # Se due schede hanno lo stesso punteggio di corrispondenza, preferiamo quella con titolo
+    # più corto/pertinente. Sottraiamo il 5% di punteggio per ogni parola specifica extra nel titolo.
+    if titolo_tokens_spec and punteggio > 0:
+        non_matchate = len(titolo_tokens_spec) - corr_spec_non_num
+        if non_matchate > 0:
+            punteggio = int(punteggio * (1.0 - 0.05 * min(10, non_matchate)))
         
     return punteggio
 
